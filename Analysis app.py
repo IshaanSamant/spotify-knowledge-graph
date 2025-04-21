@@ -18,7 +18,6 @@ NEO4J_PASSWORD = os.getenv("NEO4J_PW", "12345678")
 NEO4J_DATABASE = os.getenv("NEO4J_DB", "spotify1")
 GEMINI_API = os.getenv("GEMINI_API", "AIzaSyB0Ulb3FhRiaVsm1CPB078vF3wPHP9krWQ")
 
-# ----- Graph QA Chain -----
 @st.cache_resource
 def graph_chain():
     graph = Neo4jGraph(NEO4J_URL, NEO4J_USER, NEO4J_PASSWORD, NEO4J_DATABASE)
@@ -30,64 +29,93 @@ def graph_chain():
         graph=graph, llm=llm,
         return_intermediate_steps=True, verbose=True
     )
-    return chain
+    return chain, llm
 
-# ----- Vector Store -----
 @st.cache_resource
 def load_vector_store():
     embedder = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
     return FAISS.load_local("spotify_faiss_index", embedder, allow_dangerous_deserialization=True)
 
-# ----- QA Inference -----
-def infer(chain, prompt):
+def infer_graph(chain, prompt):
     response = chain.invoke(prompt)
     query = response["intermediate_steps"][0]["query"]
     context = response["intermediate_steps"][1]["context"]
     result = response["result"]
     return query, context, result
 
-# ----- Streamlit UI -----
+def infer_vector(vector_db, prompt):
+    return vector_db.similarity_search(prompt, k=5)
+
+def decide_routing(llm, prompt):
+    instruction = (
+        "You are a routing assistant. Based on the user query, decide whether to use:\n"
+        "'graph' if it is structured and factual,\n"
+        "'vector' if it requires similarity or vibe-based semantic search,\n"
+        "or 'both' if both are relevant.\n"
+        "Just return one word: graph, vector, or both.\n"
+        f"Query: {prompt}"
+    )
+    response = llm.invoke(instruction).content.strip().lower()
+    if response not in ["graph", "vector", "both"]:
+        return "vector"  # default fallback
+    return response
+
 if __name__ == "__main__":
-    st.set_page_config(page_title="Spotify Analysis", layout="centered")
-    st.title("🎵 Spotify Analysis Tools")
-    st.write("Made using Neo4j, LangChain, Gemini, and FAISS")
+    st.subheader("Analysis Tools")
+    st.write("Made using Neo4j, Langchain, Gemini, and FAISS")
 
-    tab1, tab2 = st.tabs(["🧠 Graph QA (Gemini + Neo4j)", "🎧 Semantic Song Search (FAISS)"])
+    try:
+        chain, llm = graph_chain()
+    except Exception as e:
+        st.error("❌ Could not connect to Neo4j. Falling back to semantic search only.")
+        chain, llm = None, ChatGoogleGenerativeAI(model="gemini-2.0-flash-lite", google_api_key=GEMINI_API)
 
-    # Tab 1: Graph QA
-    with tab1:
-        chain = graph_chain()
+    vector_db = load_vector_store()
 
-        if "messages" not in st.session_state:
-            st.session_state.messages = []
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
 
-        for message in st.session_state.messages:
-            with st.chat_message(message["role"]):
-                st.markdown(message["content"])
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
-        if prompt := st.chat_input("Ask questions about most Streamed Spotify Songs 2023"):
-            st.chat_message("user").markdown(prompt)
-            st.session_state.messages.append({"role": "user", "content": prompt})
+    if prompt := st.chat_input("Ask a question about 2023's top streamed Spotify songs"):
+        st.chat_message("user").markdown(prompt)
+        st.session_state.messages.append({"role": "user", "content": prompt})
 
-            query, context, result = infer(chain, prompt)
-            with st.chat_message("assistant"):
-                st.code(query, language="cypher")
-                st.write(context)
-                st.markdown(result)
-            st.session_state.messages.append({"role": "assistant", "content": result})
+        routing = decide_routing(llm, prompt)
+        st.info(f"🤖 Routing decision: {routing}")
 
-    # Tab 2: Semantic Search
-    with tab2:
-        vector_db = load_vector_store()
+        assistant_reply = ""
 
-        st.subheader("🎧 Semantic Song Search")
-        st.write("Find songs by describing a vibe, lyrics, artist style, or genre.")
+        if routing == "graph" and chain:
+            try:
+                query, context, result = infer_graph(chain, prompt)
+                st.chat_message("assistant").code(query, language="cypher")
+                st.chat_message("assistant").write(context)
+                st.chat_message("assistant").markdown(result)
+                assistant_reply = result
+            except Exception as e:
+                st.chat_message("assistant").markdown("⚠️ Graph search failed. Switching to vector DB...")
+                routing = "vector"
 
-        sem_query = st.text_input("Search semantically...")
+        if routing == "vector":
+            results = infer_vector(vector_db, prompt)
+            combined = "\n".join([f"**🎵 {r.metadata['title']}** by *{r.metadata['artist']}*\n{r.page_content[:250]}..." for r in results])
+            st.chat_message("assistant").markdown(combined)
+            assistant_reply = combined
 
-        if sem_query:
-            results = vector_db.similarity_search(sem_query, k=5)
+        if routing == "both" and chain:
+            try:
+                query, context, result = infer_graph(chain, prompt)
+                st.chat_message("assistant").code(query, language="cypher")
+                st.chat_message("assistant").write(context)
+                results = infer_vector(vector_db, prompt)
+                combined = "\n".join([f"**🎵 {r.metadata['title']}** by *{r.metadata['artist']}*\n{r.page_content[:250]}..." for r in results])
+                st.chat_message("assistant").markdown(result + "\n---\n" + combined)
+                assistant_reply = result + "\n---\n" + combined
+            except Exception as e:
+                st.chat_message("assistant").markdown("⚠️ One of the sources failed during combined query.")
 
-            for r in results:
-                st.markdown(f"**🎵 {r.metadata['title']}** by *{r.metadata['artist']}*")
-                st.write(r.page_content[:250] + "...")
+        if assistant_reply:
+            st.session_state.messages.append({"role": "assistant", "content": assistant_reply})
