@@ -12,7 +12,7 @@ if isinstance(torch.classes, types.ModuleType):
 # Load environment variables
 load_dotenv()
 
-from langchain_community.graphs import Neo4jGraph  # Updated import to correct graph type
+from langchain_community.graphs import Neo4jGraph
 from langchain.chains import GraphCypherQAChain
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -71,13 +71,15 @@ Use the Knowledge Graph if the query involves:
 - Tempo, energy, danceability, valence, popularity, explicit
 - Genre, artist, album, track-specific questions
 
-Use the Vector DB only if the query involves:
+Use the Vector DB if the query involves:
 - Abstract themes (e.g., heartbreak, rebellion, memories)
 - Open-ended descriptions about lyrical content or feel
 
+Use hybrid if the query includes both structured and unstructured needs.
+
 Return only one of the following: `kg`, `vector`, or `hybrid`.
 
-Query: \"{user_query}\"
+Query: "{user_query}"
 Response:
 """
     response = llm.invoke(instruction)
@@ -128,6 +130,22 @@ if __name__ == "__main__":
                     st.write(r.page_content[:300] + "...")
             st.session_state.messages.append({"role": "assistant", "content": "[Semantic search results above]"})
 
-        else:
-            st.chat_message("assistant").write("Hybrid routing not yet implemented. Showing only vector search.")
-            st.session_state.messages.append({"role": "assistant", "content": "[Hybrid not available]"})
+        elif routing == "hybrid":
+            query_result = chain.invoke(prompt)
+            query = query_result["intermediate_steps"][0]["query"]
+            context = query_result["intermediate_steps"][1]["context"]
+            kg_result = query_result["result"]
+            vector_results = vector_db.similarity_search(prompt, k=3)
+
+            with st.chat_message("assistant"):
+                st.subheader("🔗 Knowledge Graph")
+                st.code(query, language="cypher")
+                st.write(context)
+                st.markdown(kg_result)
+
+                st.subheader("🔍 Vector Search")
+                for r in vector_results:
+                    st.markdown(f"**🎵 {r.metadata['title']}** by *{r.metadata['artist']}*")
+                    st.write(r.page_content[:300] + "...")
+
+            st.session_state.messages.append({"role": "assistant", "content": "[KG + Vector results above]"})
